@@ -552,9 +552,11 @@ static int cb_kube_filter(const void *data, size_t bytes,
                     props.stderr_exclude == FLB_TRUE) {
                     continue;
                 }
-                if (props.stdout_parser == props.stderr_parser &&
-                    props.stderr_parser != NULL) {
-                    parser = flb_parser_get(props.stdout_parser, config);
+
+                if (props.stderr_parser != NULL && props.stdout_parser != NULL) {
+                    if (flb_sds_cmp(props.stdout_parser, props.stderr_parser, flb_sds_len(props.stdout_parser)) == 0) {
+                        parser = flb_parser_get(props.stdout_parser, config);
+                    }
                 }
             }
             break;
