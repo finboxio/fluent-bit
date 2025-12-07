@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -226,7 +226,7 @@ struct flb_ml_parser_ins *flb_ml_parser_instance_create(struct flb_ml *ml,
     ret = flb_ml_group_add_parser(ml, ins);
     if (ret != 0) {
         flb_error("[multiline] could not register parser '%s' on "
-                  "multiline '%s 'group", ml->name);
+                  "multiline '%s 'group", name, ml->name);
         flb_free(ins);
         return NULL;
     }

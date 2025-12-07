@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -214,7 +214,32 @@ struct flb_opensearch *flb_os_conf_create(struct flb_output_instance *ins,
         }
     }
 
+    if (ctx->compression_str) {
+        if (strcasecmp(ctx->compression_str, "gzip") == 0) {
+            ctx->compression = FLB_OS_COMPRESSION_GZIP;
+        }
+        else {
+            ctx->compression = FLB_OS_COMPRESSION_NONE;
+        }
+    }
+    else {
+        ctx->compression = FLB_OS_COMPRESSION_NONE;
+    }
+
 #ifdef FLB_HAVE_AWS
+    /* AWS Auth Unsigned Headers */
+    ctx->aws_unsigned_headers = flb_malloc(sizeof(struct mk_list));
+    if (!ctx->aws_unsigned_headers) {
+        flb_os_conf_destroy(ctx);
+        return NULL;
+    }
+    flb_slist_create(ctx->aws_unsigned_headers);
+    ret = flb_slist_add(ctx->aws_unsigned_headers, "Content-Length");
+    if (ret != 0) {
+        flb_os_conf_destroy(ctx);
+        return NULL;
+    }
+
     /* AWS Auth */
     ctx->has_aws_auth = FLB_FALSE;
     tmp = flb_output_get_property("aws_auth", ins);
@@ -257,7 +282,8 @@ struct flb_opensearch *flb_os_conf_create(struct flb_output_instance *ins,
                                                                    ctx->aws_region,
                                                                    ctx->aws_sts_endpoint,
                                                                    NULL,
-                                                                   flb_aws_client_generator());
+                                                                   flb_aws_client_generator(),
+                                                                   ctx->aws_profile);
             if (!ctx->aws_provider) {
                 flb_error("[out_es] Failed to create AWS Credential Provider");
                 flb_os_conf_destroy(ctx);
@@ -363,6 +389,11 @@ int flb_os_conf_destroy(struct flb_opensearch *ctx)
 
     if (ctx->aws_sts_tls) {
         flb_tls_destroy(ctx->aws_sts_tls);
+    }
+
+    if (ctx->aws_unsigned_headers) {
+        flb_slist_destroy(ctx->aws_unsigned_headers);
+        flb_free(ctx->aws_unsigned_headers);
     }
 #endif
 

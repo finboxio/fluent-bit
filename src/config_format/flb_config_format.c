@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -34,6 +34,70 @@ int flb_cf_file_read()
     return 0;
 }
 
+/* Retrieve the proper key name, it tries to auto-detect Yaml camelcase and convert it to snake_case */
+flb_sds_t flb_cf_key_translate(struct flb_cf *cf, char *key, int len)
+{
+    int i;
+    int x = 0;
+    int is_upper;
+    flb_sds_t out;
+
+    if (!key || len <= 0) {
+        return NULL;
+    }
+
+    /* If we got something in classic format, just convert it to lowercase and return */
+    if (cf->format == FLB_CF_CLASSIC) {
+        out = flb_sds_create_len(key, len);
+        if (!out) {
+            return NULL;
+        }
+
+        for (i = 0; i < len; i++) {
+            out[i] = tolower(key[i]);
+        }
+        flb_sds_len_set(out, len);
+        return out;
+    }
+
+    /*
+     * First step is try to identify if the incoming key is a strict Yaml camelcase format
+     */
+
+    /* does it start with a lowercase character ? */
+    if (!islower(key[0])) {
+        return flb_sds_create_len(key, len);
+    }
+
+    /* copy content and check if we have underscores */
+    out = flb_sds_create_size(len * 2);
+    flb_sds_cat_safe(&out, key, len);
+
+    for (i = 0; i < len; i++) {
+        if (key[i] == '_') {
+            /* the config is classic mode, so it's safe to return the same copy of the content */
+            for (i = 0; i < len; i++) {
+                out[i] = tolower(key[i]);
+            }
+            flb_sds_len_set(out, len);
+            return out;
+        }
+    }
+
+    /* translate from camelCase to snake_case */
+    for (i = 0; i < len; i++) {
+        is_upper = isupper(key[i]);
+        if (is_upper && i > 0) {
+            out[x++] = '_';
+        }
+        out[x++] = tolower(key[i]);
+
+    }
+    out[x] = '\0';
+    flb_sds_len_set(out, x);
+    return out;
+}
+
 struct flb_cf *flb_cf_create()
 {
     struct flb_cf *ctx;
@@ -43,6 +107,7 @@ struct flb_cf *flb_cf_create()
         flb_errno();
         return NULL;
     }
+    ctx->format = FLB_CF_CLASSIC;
 
     /* env vars */
     mk_list_init(&ctx->env);
@@ -54,7 +119,16 @@ struct flb_cf *flb_cf_create()
     mk_list_init(&ctx->parsers);
     mk_list_init(&ctx->multiline_parsers);
 
-    /* custom plugins */
+    /* stream processors */
+    mk_list_init(&ctx->stream_processors);
+
+    /* external plugins (*.so) */
+    mk_list_init(&ctx->plugins);
+
+    /* upstream servers */
+    mk_list_init(&ctx->upstream_servers);
+
+    /* 'custom' type plugins */
     mk_list_init(&ctx->customs);
 
     /* pipeline */
@@ -79,31 +153,54 @@ void flb_cf_destroy(struct flb_cf *cf)
     flb_free(cf);
 }
 
+int flb_cf_set_origin_format(struct flb_cf *cf, int format)
+{
+#ifdef FLB_HAVE_LIBYAML
+    if (format != FLB_CF_CLASSIC && format != FLB_CF_YAML) {
+#else
+    if (format != FLB_CF_CLASSIC) {
+#endif
+        return -1;
+    }
+
+    cf->format = format;
+    return 0;
+}
+
 static enum section_type get_section_type(char *name, int len)
 {
-    if (strncasecmp(name, "SERVICE", len) == 0) {
+    if (strncasecmp(name, "service", len) == 0) {
         return FLB_CF_SERVICE;
     }
-    else if (strncasecmp(name, "PARSER", len) == 0) {
+    else if (strncasecmp(name, "parser", len) == 0) {
         return FLB_CF_PARSER;
     }
-    else if (strncasecmp(name, "MULTILINE_PARSER", len) == 0) {
+    else if (strncasecmp(name, "multiline_parser", len) == 0) {
         return FLB_CF_MULTILINE_PARSER;
     }
-    else if (strncasecmp(name, "CUSTOM", len) == 0 ||
-             strncasecmp(name, "CUSTOMS", len) == 0) {
+    else if (strncasecmp(name, "stream_processor", len) == 0) {
+        return FLB_CF_STREAM_PROCESSOR;
+    }
+    else if (strncasecmp(name, "plugins", len) == 0) {
+        return FLB_CF_PLUGINS;
+    }
+    else if (strncasecmp(name, "upstream_servers", len) == 0) {
+        return FLB_CF_UPSTREAM_SERVERS;
+    }
+    else if (strncasecmp(name, "custom", len) == 0 ||
+             strncasecmp(name, "customs", len) == 0) {
         return FLB_CF_CUSTOM;
     }
-    else if (strncasecmp(name, "INPUT", len) == 0 ||
-             strncasecmp(name, "INPUTS", len) == 0) {
+    else if (strncasecmp(name, "input", len) == 0 ||
+             strncasecmp(name, "inputs", len) == 0) {
         return FLB_CF_INPUT;
     }
-    else if (strncasecmp(name, "FILTER", len) == 0 ||
-             strncasecmp(name, "FILTERS", len) == 0) {
+    else if (strncasecmp(name, "filter", len) == 0 ||
+             strncasecmp(name, "filters", len) == 0) {
         return FLB_CF_FILTER;
     }
-    else if (strncasecmp(name, "OUTPUT", len) == 0 ||
-             strncasecmp(name, "OUTPUTS", len) == 0) {
+    else if (strncasecmp(name, "output", len) == 0 ||
+             strncasecmp(name, "outputs", len) == 0) {
         return FLB_CF_OUTPUT;
     }
 
@@ -115,7 +212,6 @@ int flb_cf_plugin_property_add(struct flb_cf *cf,
                                char *k_buf, size_t k_len,
                                char *v_buf, size_t v_len)
 {
-    int i;
     int ret;
     flb_sds_t key;
     flb_sds_t val;
@@ -127,7 +223,8 @@ int flb_cf_plugin_property_add(struct flb_cf *cf,
         v_len = strlen(v_buf);
     }
 
-    key = flb_sds_create_len(k_buf, k_len);
+
+    key = flb_cf_key_translate(cf, k_buf, k_len);
     if (key == NULL) {
         return -1;
     }
@@ -166,17 +263,16 @@ struct cfl_variant *flb_cf_section_property_add(struct flb_cf *cf,
                                               char *k_buf, size_t k_len,
                                               char *v_buf, size_t v_len)
 {
-    int i;
     int rc;
     flb_sds_t key;
     flb_sds_t val;
     struct cfl_variant *var;
 
-
     if (k_len == 0) {
         k_len = strlen(k_buf);
     }
-    key = flb_sds_create_len(k_buf, k_len);
+
+    key = flb_cf_key_translate(cf, k_buf, k_len);
     if (key == NULL) {
         goto key_error;
     }
@@ -186,10 +282,6 @@ struct cfl_variant *flb_cf_section_property_add(struct flb_cf *cf,
     if (rc == -1) {
         flb_cf_error_set(cf, FLB_CF_ERROR_KV_INVALID_KEY);
         goto val_error;
-    }
-
-    for (i = 0; i < flb_sds_len(key); i++) {
-        key[i] = tolower(key[i]);
     }
 
     if (v_len == 0) {
@@ -242,7 +334,8 @@ struct cfl_array *flb_cf_section_property_add_list(struct flb_cf *cf,
     if (k_len == 0) {
         k_len = strlen(k_buf);
     }
-    key = flb_sds_create_len(k_buf, k_len);
+
+    key = flb_cf_key_translate(cf, k_buf, k_len);
     if (key == NULL) {
         goto key_error;
     }
@@ -285,12 +378,10 @@ flb_sds_t flb_cf_section_property_get_string(struct flb_cf *cf, struct flb_cf_se
     flb_sds_t ret = NULL;
     struct cfl_variant *entry;
     int i;
+    int len;
 
-
-    tkey = flb_sds_create(key);
-    for (i = 0; i < strlen(key); i++) {
-        tkey[i] = tolower(key[i]);
-    }
+    len = strlen(key);
+    tkey = flb_cf_key_translate(cf, key, len);
 
     val = cfl_kvlist_fetch(s->properties, key);
     flb_sds_destroy(tkey);
@@ -421,6 +512,9 @@ struct flb_kv *flb_cf_meta_property_add(struct flb_cf *cf, char *meta, int len)
 
     p = meta;
     tmp = strchr(p, ' ');
+    if (tmp == NULL) {
+        return NULL;
+    }
     xlen = (tmp - p);
 
     /* create k/v pair */
@@ -447,6 +541,10 @@ struct flb_cf_group *flb_cf_group_create(struct flb_cf *cf, struct flb_cf_sectio
 
     /* initialize lists */
     g->properties = cfl_kvlist_create();
+    if (g->properties == NULL) {
+	flb_free(g);
+	return NULL;
+    }
 
     /* determinate type by name */
     if (len <= 0) {
@@ -456,6 +554,7 @@ struct flb_cf_group *flb_cf_group_create(struct flb_cf *cf, struct flb_cf_sectio
     /* create a NULL terminated name */
     g->name = flb_sds_create_len(name, len);
     if (!g->name) {
+        cfl_kvlist_destroy(g->properties);
         flb_free(g);
         return NULL;
     }
@@ -464,6 +563,26 @@ struct flb_cf_group *flb_cf_group_create(struct flb_cf *cf, struct flb_cf_sectio
     mk_list_add(&g->_head, &s->groups);
 
     return g;
+}
+
+struct flb_cf_group *flb_cf_group_get(struct flb_cf *cf, struct flb_cf_section *s, char *name)
+{
+    struct mk_list *head;
+    struct flb_cf_group *g;
+
+    mk_list_foreach(head, &s->groups) {
+        g = mk_list_entry(head, struct flb_cf_group, _head);
+        if (strcasecmp(g->name, name) == 0){
+            return g;
+        }
+    }
+
+    return NULL;
+}
+
+void flb_cf_group_print(struct flb_cf_group *g)
+{
+    cfl_kvlist_print(stdout, g->properties);
 }
 
 void flb_cf_group_destroy(struct flb_cf_group *g)
@@ -513,6 +632,7 @@ struct flb_cf_section *flb_cf_section_create(struct flb_cf *cf, char *name, int 
     /* create a NULL terminated name */
     s->name = flb_sds_create_len(name, len);
     if (!s->name) {
+        flb_free(s->properties);
         flb_free(s);
         return NULL;
     }
@@ -531,6 +651,15 @@ struct flb_cf_section *flb_cf_section_create(struct flb_cf *cf, char *name, int 
     }
     else if (type == FLB_CF_MULTILINE_PARSER) {
         mk_list_add(&s->_head_section, &cf->multiline_parsers);
+    }
+    else if (type == FLB_CF_STREAM_PROCESSOR) {
+        mk_list_add(&s->_head_section, &cf->stream_processors);
+    }
+    else if (type == FLB_CF_PLUGINS) {
+        mk_list_add(&s->_head_section, &cf->plugins);
+    }
+    else if (type == FLB_CF_UPSTREAM_SERVERS) {
+        mk_list_add(&s->_head_section, &cf->upstream_servers);
     }
     else if (type == FLB_CF_CUSTOM) {
         mk_list_add(&s->_head_section, &cf->customs);
@@ -626,6 +755,12 @@ static char *section_type_str(int type)
         return "PARSER";
     case FLB_CF_MULTILINE_PARSER:
         return "MULTILINE_PARSER";
+    case FLB_CF_STREAM_PROCESSOR:
+        return "STREAM_PROCESSOR";
+    case FLB_CF_PLUGINS:
+        return "PLUGINS";
+    case FLB_CF_UPSTREAM_SERVERS:
+        return "UPSTREAM_SERVERS";
     case FLB_CF_CUSTOM:
         return "CUSTOM";
     case FLB_CF_INPUT:
@@ -686,6 +821,40 @@ static void dump_section(struct flb_cf_section *s)
     }
 }
 
+static void dump_env(struct mk_list *list)
+{
+    struct mk_list *head;
+    struct flb_kv *kv;
+
+    if (mk_list_size(list) == 0) {
+        return;
+    }
+
+    printf("> env:\n");
+
+    mk_list_foreach(head, list) {
+        kv = mk_list_entry(head, struct flb_kv, _head);
+        printf("    - %-15s: %s\n", kv->key, kv->val);
+    }
+}
+
+static void dump_metas(struct mk_list *list)
+{
+    struct mk_list *head;
+    struct flb_kv *kv;
+
+    if (mk_list_size(list) == 0) {
+        return;
+    }
+
+    printf("> metas:\n");
+
+    mk_list_foreach(head, list) {
+        kv = mk_list_entry(head, struct flb_kv, _head);
+        printf("    - %-15s: %s\n", kv->key, kv->val);
+    }
+}
+
 static void dump_section_list(struct mk_list *list)
 {
     struct mk_list *head;
@@ -699,6 +868,8 @@ static void dump_section_list(struct mk_list *list)
 
 void flb_cf_dump(struct flb_cf *cf)
 {
+    dump_metas(&cf->metas);
+    dump_env(&cf->env);
     dump_section_list(&cf->sections);
 }
 

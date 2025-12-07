@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,6 +25,7 @@
 #include <fluent-bit/flb_input.h>
 #include <fluent-bit/flb_utils.h>
 #include <fluent-bit/flb_parser.h>
+#include <fluent-bit/flb_log_event_encoder.h>
 #include <fluent-bit/wasm/flb_wasm.h>
 
 #include <msgpack.h>
@@ -32,6 +33,9 @@
 #define DEFAULT_BUF_SIZE      "4096"
 #define DEFAULT_INTERVAL_SEC  "1"
 #define DEFAULT_INTERVAL_NSEC "0"
+
+#define DEFAULT_WASM_HEAP_SIZE  "8192"
+#define DEFAULT_WASM_STACK_SIZE "8192"
 
 struct flb_exec_wasi {
     flb_sds_t wasi_path;
@@ -43,10 +47,15 @@ struct flb_exec_wasi {
     size_t buf_size;
     struct flb_input_instance *ins;
     struct flb_wasm *wasm;
+    struct flb_wasm_config *wasm_conf;
     int oneshot;
     flb_pipefd_t ch_manager[2];
     int interval_sec;
     int interval_nsec;
+    size_t wasm_heap_size;
+    size_t wasm_stack_size;
+    struct flb_log_event_encoder log_encoder;
+    int coll_fd;
 };
 
 #endif /* FLB_IN_EXEC_WASI_H */

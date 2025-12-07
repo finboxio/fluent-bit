@@ -70,7 +70,6 @@ void do_test_records_trace(void (*records_cb)(struct callback_records *))
     flb_ctx_t    *ctx    = NULL;
     struct flb_input_instance *input;
     struct flb_output_instance *output;
-    struct flb_output_instance *trace_output;
     int i;
     struct flb_lib_out_cb cb;
     struct callback_records *records;
@@ -108,6 +107,7 @@ void do_test_records_trace(void (*records_cb)(struct callback_records *))
     records_cb(records);
     
     flb_stop(ctx);
+    sleep(5);
 
     for (i = 0; i < records->num_records; i++) {
         flb_lib_free(records->records[i].data);

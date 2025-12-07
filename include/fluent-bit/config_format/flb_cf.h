@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -50,10 +50,15 @@ enum cf_file_format {
 #endif
 };
 
+#define FLB_CF_CLASSIC FLB_CF_FLUENTBIT
+
 enum section_type {
     FLB_CF_SERVICE = 0,           /* [SERVICE]           */
     FLB_CF_PARSER,                /* [PARSER]            */
-    FLB_CF_MULTILINE_PARSER,      /* [MULTILINE_PARSER]  */
+    FLB_CF_MULTILINE_PARSER,      /* multiline_parser    */
+    FLB_CF_STREAM_PROCESSOR,      /* stream_processor    */
+    FLB_CF_PLUGINS,               /* plugins             */
+    FLB_CF_UPSTREAM_SERVERS,      /* upstream_servers    */
     FLB_CF_CUSTOM,                /* [CUSTOM]            */
     FLB_CF_INPUT,                 /* [INPUT]             */
     FLB_CF_FILTER,                /* [FILTER]            */
@@ -62,23 +67,26 @@ enum section_type {
 };
 
 struct flb_cf_group {
-    flb_sds_t name;               /* group name */
-    struct cfl_kvlist *properties;    /* key value properties */
-    struct mk_list _head;         /* link to struct flb_cf_section->groups */
+    flb_sds_t name;                /* group name */
+    struct cfl_kvlist *properties; /* key value properties */
+    struct mk_list _head;          /* link to struct flb_cf_section->groups */
 };
 
 struct flb_cf_section {
     int type;
-    flb_sds_t name;               /* name (used for FLB_CF_OTHER type) */
-    struct cfl_kvlist *properties;    /* key value properties              */
+    flb_sds_t name;                /* name (used for FLB_CF_OTHER type) */
+    struct cfl_kvlist *properties; /* key value properties              */
 
-    struct mk_list groups;        /* list of groups */
+    struct mk_list groups;         /* list of groups */
 
-    struct mk_list _head;         /* link to struct flb_cf->sections */
-    struct mk_list _head_section; /* link to section type, e.g: inputs, filters.. */
+    struct mk_list _head;          /* link to struct flb_cf->sections */
+    struct mk_list _head_section;  /* link to section type, e.g: inputs, filters.. */
 };
 
 struct flb_cf {
+    /* origin format */
+    int format;
+
     /* global service */
     struct flb_cf_section *service;
 
@@ -92,7 +100,16 @@ struct flb_cf {
     struct mk_list parsers;
     struct mk_list multiline_parsers;
 
-    /* custom plugins */
+    /* stream processor: every entry is added as a task */
+    struct mk_list stream_processors;
+
+    /* external plugins (.so) */
+    struct mk_list plugins;
+
+    /* upstream servers */
+    struct mk_list upstream_servers;
+
+    /* 'custom' type plugins */
     struct mk_list customs;
 
     /* pipeline */
@@ -117,9 +134,11 @@ struct flb_cf {
 
 struct flb_cf *flb_cf_create();
 struct flb_cf *flb_cf_create_from_file(struct flb_cf *cf, char *file);
+flb_sds_t flb_cf_key_translate(struct flb_cf *cf, char *key, int len);
 
 void flb_cf_destroy(struct flb_cf *cf);
 
+int flb_cf_set_origin_format(struct flb_cf *cf, int format);
 void flb_cf_dump(struct flb_cf *cf);
 
 struct flb_kv *flb_cf_env_property_add(struct flb_cf *cf,
@@ -138,6 +157,9 @@ void flb_cf_meta_destroy_all(struct flb_cf *cf);
 /* groups */
 struct flb_cf_group *flb_cf_group_create(struct flb_cf *cf, struct flb_cf_section *s,
                                          char *name, int len);
+struct flb_cf_group *flb_cf_group_get(struct flb_cf *cf, struct flb_cf_section *s, char *name);
+void flb_cf_group_print(struct flb_cf_group *g);
+
 void flb_cf_group_destroy(struct flb_cf_group *g);
 
 /* sections */

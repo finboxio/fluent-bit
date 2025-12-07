@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -128,13 +128,10 @@ int syslog_dgram_conn_event(void *data)
     struct flb_connection *connection;
     int                    bytes;
     struct syslog_conn    *conn;
-    struct flb_syslog     *ctx;
 
     connection = (struct flb_connection *) data;
 
     conn = connection->user_data;
-
-    ctx = conn->ctx;
 
     bytes = flb_io_net_read(connection,
                             (void *) &conn->buf_data[conn->buf_len],
@@ -144,7 +141,7 @@ int syslog_dgram_conn_event(void *data)
         conn->buf_data[bytes] = '\0';
         conn->buf_len = bytes;
 
-        syslog_prot_process_udp(conn->buf_data, conn->buf_len, ctx);
+        syslog_prot_process_udp(conn);
     }
     else {
         flb_errno();
@@ -197,7 +194,7 @@ struct syslog_conn *syslog_conn_add(struct flb_connection *connection,
      * stream mode (UDP events are received through the collector)
      */
     if (!ctx->dgram_mode_flag) {
-        ret = mk_event_add(ctx->evl,
+        ret = mk_event_add(flb_engine_evl_get(),
                            connection->fd,
                            FLB_ENGINE_EV_CUSTOM,
                            MK_EVENT_READ,

@@ -226,14 +226,16 @@ static int unpack_opts(mpack_reader_t *reader, struct cmt_opts *opts)
             return CMT_DECODE_MSGPACK_ALLOCATION_ERROR;
         }
 
-        cfl_sds_cat(opts->fqname, opts->ns, cfl_sds_len(opts->ns));
-        cfl_sds_cat(opts->fqname, "_", 1);
+        if (cfl_sds_len(opts->ns) > 0) {
+            cfl_sds_cat_safe(&opts->fqname, opts->ns, cfl_sds_len(opts->ns));
+            cfl_sds_cat_safe(&opts->fqname, "_", 1);
+        }
 
         if (cfl_sds_len(opts->subsystem) > 0) {
-            cfl_sds_cat(opts->fqname, opts->subsystem, cfl_sds_len(opts->subsystem));
-            cfl_sds_cat(opts->fqname, "_", 1);
+            cfl_sds_cat_safe(&opts->fqname, opts->subsystem, cfl_sds_len(opts->subsystem));
+            cfl_sds_cat_safe(&opts->fqname, "_", 1);
         }
-        cfl_sds_cat(opts->fqname, opts->name, cfl_sds_len(opts->name));
+        cfl_sds_cat_safe(&opts->fqname, opts->name, cfl_sds_len(opts->name));
     }
 
     return result;
@@ -876,10 +878,14 @@ static int unpack_meta_bucket(mpack_reader_t *reader, size_t index, void *contex
 
     decode_context = (struct cmt_msgpack_decode_context *) context;
 
+    if (decode_context->bucket_count == 0) {
+        return CMT_DECODE_MSGPACK_INVALID_ARGUMENT_ERROR;
+    }
+
     return cmt_mpack_consume_double_tag(reader, &decode_context->bucket_list[index]);
 }
 
-static int unpack_meta_buckets(mpack_reader_t *reader, size_t index, void *context)
+static int  unpack_meta_buckets(mpack_reader_t *reader, size_t index, void *context)
 {
     struct cmt_msgpack_decode_context *decode_context;
 
@@ -899,6 +905,7 @@ static int unpack_meta_buckets(mpack_reader_t *reader, size_t index, void *conte
         if (NULL == decode_context->bucket_list) {
             return CMT_DECODE_MSGPACK_ALLOCATION_ERROR;
         }
+
     }
 
     return cmt_mpack_unpack_array(reader, unpack_meta_bucket, context);
@@ -972,17 +979,25 @@ static int unpack_basic_type_meta(mpack_reader_t *reader, size_t index, void *co
     result = cmt_mpack_unpack_map(reader, callbacks, context);
 
     if (CMT_DECODE_MSGPACK_SUCCESS == result) {
-        decode_context->map->label_count = cfl_list_size(&decode_context->map->label_keys);
+	if (decode_context->map == NULL || decode_context->map->parent == NULL) {
+            return CMT_DECODE_MSGPACK_INVALID_ARGUMENT_ERROR;
+	}
 
+        decode_context->map->label_count = cfl_list_size(&decode_context->map->label_keys);
         if (decode_context->map->type == CMT_HISTOGRAM) {
             histogram = (struct cmt_histogram *) decode_context->map->parent;
 
-            histogram->buckets =
-                cmt_histogram_buckets_create_size(decode_context->bucket_list,
-                                                  decode_context->bucket_count);
+            if (decode_context->bucket_count > 0) {
+                histogram->buckets =
+                    cmt_histogram_buckets_create_size(decode_context->bucket_list,
+                                                      decode_context->bucket_count);
 
-            if (histogram->buckets == NULL) {
-                result = CMT_DECODE_MSGPACK_ALLOCATION_ERROR;
+                if (histogram->buckets == NULL) {
+                    result = CMT_DECODE_MSGPACK_ALLOCATION_ERROR;
+                }
+            }
+            else {
+                histogram->buckets = NULL;
             }
         }
         else if (decode_context->map->type == CMT_SUMMARY) {
@@ -995,7 +1010,7 @@ static int unpack_basic_type_meta(mpack_reader_t *reader, size_t index, void *co
             decode_context->quantile_count = 0;
         }
         else if(decode_context->map->type == CMT_COUNTER) {
-            counter = (struct counter *) decode_context->map->parent;
+            counter = (struct cmt_counter *) decode_context->map->parent;
             counter->aggregation_type = decode_context->aggregation_type;
         }
     }

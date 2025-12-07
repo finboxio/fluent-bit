@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -27,9 +27,10 @@
 #include <fluent-bit/flb_upstream_node.h>
 
 /* Create a new Upstream Node context */
-struct flb_upstream_node *flb_upstream_node_create(const char *name, const char *host,
-                                                   const char *port,
+struct flb_upstream_node *flb_upstream_node_create(flb_sds_t name, flb_sds_t host,
+                                                   flb_sds_t port,
                                                    int tls, int tls_verify,
+                                                   int tls_verify_hostname,
                                                    int tls_debug,
                                                    const char *tls_vhost,
                                                    const char *tls_ca_path,
@@ -40,6 +41,7 @@ struct flb_upstream_node *flb_upstream_node_create(const char *name, const char 
                                                    struct flb_hash_table *ht,
                                                    struct flb_config *config)
 {
+    int ret;
     int i_port;
     int io_flags;
     char tmp[255];
@@ -66,18 +68,18 @@ struct flb_upstream_node *flb_upstream_node_create(const char *name, const char 
         node->name = flb_sds_create(tmp);
     }
     else {
-        node->name = flb_sds_create(name);
+        node->name = name;
     }
 
     /* host */
-    node->host = flb_sds_create(host);
+    node->host = host;
     if (!node->host) {
         flb_upstream_node_destroy(node);
         return NULL;
     }
 
     /* port */
-    node->port = flb_sds_create(port);
+    node->port = port;
     if (!node->port) {
         flb_upstream_node_destroy(node);
         return NULL;
@@ -143,6 +145,16 @@ struct flb_upstream_node *flb_upstream_node_create(const char *name, const char 
             return NULL;
         }
         node->tls_enabled = FLB_TRUE;
+        if (tls_verify_hostname == FLB_TRUE) {
+            ret = flb_tls_set_verify_hostname(node->tls, tls_verify_hostname);
+            if (ret == -1) {
+                flb_error("[upstream_node] error set up to verify hostname in TLS context "
+                          "on node '%s'", name);
+                flb_upstream_node_destroy(node);
+
+                return NULL;
+            }
+        }
     }
 #endif
 

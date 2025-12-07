@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -34,6 +34,7 @@ struct flb_record_accessor {
     struct mk_list _head;        /* Head to custom list (only used by flb_mp.h) */
 };
 
+int flb_ra_subkey_count(struct flb_record_accessor *ra);
 struct flb_record_accessor *flb_ra_create(char *str, int translate_env);
 void flb_ra_destroy(struct flb_record_accessor *ra);
 void flb_ra_dump(struct flb_record_accessor *ra);

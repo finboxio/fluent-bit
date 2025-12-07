@@ -32,7 +32,6 @@ void wait_with_timeout(uint32_t timeout_ms, struct kube_test_result *result, int
     struct flb_time end_time;
     struct flb_time diff_time;
     uint64_t elapsed_time_flb = 0;
-    int64_t ret = 0;
 
     flb_time_get(&start_time);
 
@@ -401,6 +400,28 @@ static void flb_test_core_unescaping_json()
     flb_test_core("core_unescaping_json", NULL, 1);
 }
 
+#define flb_test_namespace_labels_and_annotations(target, suffix, nExpected) \
+    kube_test("core/" target, KUBE_TAIL, suffix, nExpected, \
+              "Namespace_labels", "On", \
+              "Namespace_annotations", "On", \
+              NULL); \
+
+static void flb_test_core_base_with_namespace_labels_and_annotations()
+{
+    flb_test_namespace_labels_and_annotations("core_base-with-namespace-labels-and-annotations_fluent-bit", NULL, 1);
+}
+
+#define flb_test_owner_references(target, suffix, nExpected) \
+    kube_test("core/" target, KUBE_TAIL, suffix, nExpected, \
+              "Labels", "Off", \
+              "Annotations", "Off", \
+              "Owner_References", "On", \
+              NULL); \
+
+static void flb_test_core_base_with_owner_references()
+{
+    flb_test_owner_references("core_base-with-owner-references_fluent-bit", NULL, 1);
+}
 
 #define flb_test_options_use_kubelet_enabled(target, suffix, nExpected) \
     kube_test("options/" target, KUBE_TAIL, suffix, nExpected, \
@@ -937,13 +958,13 @@ static void flb_test_systemd_logs()
         sd_journal *journal;
         r = sd_journal_open(&journal, 0);
         if (r < 0) {
-            flb_error("Skip test: journal error: ", strerror(-r));
+            flb_error("Skip test: journal error: %s", strerror(-r));
             return;
         }
 
         r = sd_journal_get_fd(journal);
         if (r < 0) {
-            flb_error("Skip test: journal fd error: ", strerror(-r));
+            flb_error("Skip test: journal fd error: %s", strerror(-r));
             sd_journal_close(journal);
             return;
         }
@@ -956,28 +977,28 @@ static void flb_test_systemd_logs()
          */
         if (flb_test_systemd_send() < 0) {
 
-            flb_error("Skip test: journal send error: ", strerror(-r));
+            flb_error("Skip test: journal send error: %s", strerror(-r));
             sd_journal_close(journal);
             return;
         }
 
         r = sd_journal_previous(journal);
         if (r < 0) {
-            flb_error("Skip test: journal previous error: ", strerror(-r));
+            flb_error("Skip test: journal previous error: %s", strerror(-r));
             sd_journal_close(journal);
             return;
         }
 
         r = sd_journal_next(journal);
         if (r < 0) {
-            flb_error("Skip test: journal next error: ", strerror(-r));
+            flb_error("Skip test: journal next error: %s", strerror(-r));
             sd_journal_close(journal);
             return;
         }
 
         r = sd_journal_wait(journal, 2000);
         if (r < 0) {
-            flb_error("Skip test: journal wait error: ", strerror(-r));
+            flb_error("Skip test: journal wait error: %s", strerror(-r));
             sd_journal_close(journal);
             return;
         }
@@ -995,6 +1016,8 @@ TEST_LIST = {
     {"kube_core_no_meta", flb_test_core_no_meta},
     {"kube_core_unescaping_text", flb_test_core_unescaping_text},
     {"kube_core_unescaping_json", flb_test_core_unescaping_json},
+    {"kube_core_base_with_namespace_labels_and_annotations", flb_test_core_base_with_namespace_labels_and_annotations},
+    {"kube_core_base_with_owner_references", flb_test_core_base_with_owner_references},
     {"kube_options_use-kubelet_enabled_json", flb_test_options_use_kubelet_enabled_json},
     {"kube_options_use-kubelet_disabled_json", flb_test_options_use_kubelet_disabled_json},
     {"kube_options_merge_log_enabled_text", flb_test_options_merge_log_enabled_text},

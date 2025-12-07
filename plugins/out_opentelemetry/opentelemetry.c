@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -18,17 +18,21 @@
  */
 
 #include <fluent-bit/flb_output_plugin.h>
+#include <fluent-bit/flb_input_event.h>
 #include <fluent-bit/flb_snappy.h>
 #include <fluent-bit/flb_metrics.h>
 #include <fluent-bit/flb_time.h>
 #include <fluent-bit/flb_kv.h>
 #include <fluent-bit/flb_pack.h>
+#include <fluent-bit/flb_log_event_decoder.h>
+#include <fluent-bit/flb_ra_key.h>
 
 #include <cfl/cfl.h>
 #include <fluent-otel-proto/fluent-otel.h>
 
 #include <cmetrics/cmetrics.h>
 #include <fluent-bit/flb_gzip.h>
+#include <fluent-bit/flb_zstd.h>
 #include <cmetrics/cmt_encode_opentelemetry.h>
 
 #include <ctraces/ctraces.h>
@@ -39,140 +43,85 @@ extern void cmt_encode_opentelemetry_destroy(cfl_sds_t text);
 
 #include "opentelemetry.h"
 #include "opentelemetry_conf.h"
+#include "opentelemetry_utils.h"
 
-static inline Opentelemetry__Proto__Common__V1__AnyValue *msgpack_object_to_otlp_any_value(struct msgpack_object *o);
-
-static inline void otlp_any_value_destroy(Opentelemetry__Proto__Common__V1__AnyValue *value);
-static inline void otlp_kvpair_destroy(Opentelemetry__Proto__Common__V1__KeyValue *kvpair);
-static inline void otlp_kvlist_destroy(Opentelemetry__Proto__Common__V1__KeyValueList *kvlist);
-static inline void otlp_array_destroy(Opentelemetry__Proto__Common__V1__ArrayValue *array);
-
-static inline void otlp_kvpair_destroy(Opentelemetry__Proto__Common__V1__KeyValue *kvpair)
+int opentelemetry_legacy_post(struct opentelemetry_context *ctx,
+                              const void *body, size_t body_len,
+                              const char *tag, int tag_len,
+                              const char *uri)
 {
-    if (kvpair != NULL) {
-        if (kvpair->key != NULL) {
-            flb_free(kvpair->key);
-        }
-
-        if (kvpair->value != NULL) {
-            otlp_any_value_destroy(kvpair->value);
-        }
-
-        flb_free(kvpair);
-    }
-}
-
-static inline void otlp_kvlist_destroy(Opentelemetry__Proto__Common__V1__KeyValueList *kvlist)
-{
-    size_t index;
-
-    if (kvlist != NULL) {
-        if (kvlist->values != NULL) {
-            for (index = 0 ; index < kvlist->n_values ; index++) {
-                otlp_kvpair_destroy(kvlist->values[index]);
-            }
-
-            flb_free(kvlist->values);
-        }
-
-        flb_free(kvlist);
-    }
-}
-
-static inline void otlp_array_destroy(Opentelemetry__Proto__Common__V1__ArrayValue *array)
-{
-    size_t index;
-
-    if (array != NULL) {
-        if (array->values != NULL) {
-            for (index = 0 ; index < array->n_values ; index++) {
-                otlp_any_value_destroy(array->values[index]);
-            }
-
-            flb_free(array->values);
-        }
-
-        flb_free(array);
-    }
-}
-
-static inline void otlp_any_value_destroy(Opentelemetry__Proto__Common__V1__AnyValue *value)
-{
-    if (value != NULL) {
-        if (value->value_case == OPENTELEMETRY__PROTO__COMMON__V1__ANY_VALUE__VALUE_STRING_VALUE) {
-            if (value->string_value != NULL) {
-                flb_free(value->string_value);
-                value->string_value = NULL;
-            }
-        }
-        else if (value->value_case == OPENTELEMETRY__PROTO__COMMON__V1__ANY_VALUE__VALUE_ARRAY_VALUE) {
-            if (value->array_value != NULL) {
-                otlp_array_destroy(value->array_value);
-            }
-        }
-        else if (value->value_case == OPENTELEMETRY__PROTO__COMMON__V1__ANY_VALUE__VALUE_KVLIST_VALUE) {
-            if (value->kvlist_value != NULL) {
-                otlp_kvlist_destroy(value->kvlist_value);
-            }
-        }
-        else if (value->value_case == OPENTELEMETRY__PROTO__COMMON__V1__ANY_VALUE__VALUE_BYTES_VALUE) {
-            if (value->bytes_value.data != NULL) {
-                flb_free(value->bytes_value.data);
-            }
-        }
-
-        flb_free(value);
-        value = NULL;
-    }
-}
-
-static int http_post(struct opentelemetry_context *ctx,
-                     const void *body, size_t body_len,
-                     const char *tag, int tag_len,
-                     const char *uri)
-{
-    int ret;
-    int out_ret = FLB_OK;
-    size_t b_sent;
-    struct flb_upstream *u;
-    struct flb_connection *u_conn;
-    struct flb_http_client *c;
-    struct mk_list *head;
+    size_t                     final_body_len;
+    void                      *final_body;
+    int                        compressed;
+    int                        out_ret;
+    size_t                     b_sent;
+    struct flb_connection     *u_conn;
+    struct mk_list            *head;
+    int                        ret;
+    struct flb_slist_entry    *key;
+    struct flb_slist_entry    *val;
     struct flb_config_map_val *mv;
-    struct flb_slist_entry *key = NULL;
-    struct flb_slist_entry *val = NULL;
-    void *final_body = NULL;
-    size_t final_body_len = 0;
-    int compressed = FLB_FALSE;
+    struct flb_http_client    *c;
 
-    /* Get upstream context and connection */
-    u = ctx->u;
-    u_conn = flb_upstream_conn_get(u);
-    if (!u_conn) {
-        flb_plg_error(ctx->ins, "no upstream connections available to %s:%i",
-                      u->tcp_host, u->tcp_port);
+    compressed = FLB_FALSE;
+
+    u_conn = flb_upstream_conn_get(ctx->u);
+
+    if (u_conn == NULL) {
+        flb_plg_error(ctx->ins,
+                      "no upstream connections available to %s:%i",
+                      ctx->u->tcp_host,
+                      ctx->u->tcp_port);
+
         return FLB_RETRY;
     }
-     if (ctx->compress_gzip == FLB_TRUE) {
+
+    if (ctx->compress_gzip) {
         ret = flb_gzip_compress((void *) body, body_len,
                                 &final_body, &final_body_len);
-        if (ret == -1) {
-            flb_plg_error(ctx->ins, "cannot gzip payload, disabling compression");
-        } else {
+
+        if (ret == 0) {
             compressed = FLB_TRUE;
         }
-    } else {
-        final_body = body;
+        else {
+            flb_plg_error(ctx->ins, "cannot gzip payload, disabling compression");
+        }
+    }
+    else if (ctx->compress_zstd) {
+        ret = flb_zstd_compress((void *) body, body_len,
+                                &final_body, &final_body_len);
+
+        if (ret == 0) {
+            compressed = FLB_TRUE;
+        }
+        else {
+            flb_plg_error(ctx->ins, "cannot zstd payload, disabling compression");
+        }
+    }
+    else {
+        final_body = (void *) body;
         final_body_len = body_len;
     }
+
     /* Create HTTP client context */
     c = flb_http_client(u_conn, FLB_HTTP_POST, uri,
                         final_body, final_body_len,
                         ctx->host, ctx->port,
                         ctx->proxy, 0);
 
+    if (c == NULL) {
+        flb_plg_error(ctx->ins, "error initializing http client");
 
-    if (c->proxy.host) {
+        if (compressed) {
+            flb_free(final_body);
+        }
+
+        flb_upstream_conn_release(u_conn);
+
+        return FLB_RETRY;
+    }
+
+    if (c->proxy.host != NULL) {
         flb_plg_debug(ctx->ins, "[http_client] proxy host: %s port: %i",
                       c->proxy.host, c->proxy.port);
     }
@@ -193,7 +142,8 @@ static int http_post(struct opentelemetry_context *ctx,
                         sizeof(FLB_OPENTELEMETRY_MIME_PROTOBUF_LITERAL) - 1);
 
     /* Basic Auth headers */
-    if (ctx->http_user && ctx->http_passwd) {
+    if (ctx->http_user != NULL &&
+        ctx->http_passwd != NULL) {
         flb_http_basic_auth(c, ctx->http_user, ctx->http_passwd);
     }
 
@@ -207,10 +157,21 @@ static int http_post(struct opentelemetry_context *ctx,
                             key->str, flb_sds_len(key->str),
                             val->str, flb_sds_len(val->str));
     }
-    if (compressed == FLB_TRUE) {
-        flb_http_set_content_encoding_gzip(c);
+
+    if (compressed) {
+        if (ctx->compress_gzip) {
+            flb_http_set_content_encoding_gzip(c);
+        }
+        else if (ctx->compress_zstd) {
+            flb_http_set_content_encoding_zstd(c);
+        }
     }
+
+    /* Map debug callbacks */
+    flb_http_client_debug(c, ctx->ins->callback);
+
     ret = flb_http_do(c, &b_sent);
+
     if (ret == 0) {
         /*
          * Only allow the following HTTP status:
@@ -225,44 +186,49 @@ static int http_post(struct opentelemetry_context *ctx,
          */
         if (c->resp.status < 200 || c->resp.status > 205) {
             if (ctx->log_response_payload &&
-                c->resp.payload && c->resp.payload_size > 0) {
-                flb_plg_error(ctx->ins, "%s:%i, HTTP status=%i\n%s",
+                c->resp.payload != NULL &&
+                c->resp.payload_size > 0) {
+                flb_plg_error(ctx->ins, "%s:%i, HTTP status=%i\n%.*s",
                               ctx->host, ctx->port,
-                              c->resp.status, c->resp.payload);
+                              c->resp.status,
+                              (int) c->resp.payload_size,
+                              c->resp.payload);
             }
             else {
                 flb_plg_error(ctx->ins, "%s:%i, HTTP status=%i",
                               ctx->host, ctx->port, c->resp.status);
             }
+
             out_ret = FLB_RETRY;
         }
         else {
-            if (ctx->log_response_payload &&
-                c->resp.payload && c->resp.payload_size > 0) {
-                flb_plg_info(ctx->ins, "%s:%i, HTTP status=%i\n%s",
+            if (ctx->log_response_payload && c->resp.payload != NULL && c->resp.payload_size > 2) {
+                flb_plg_info(ctx->ins, "%s:%i, HTTP status=%i%.*s",
                              ctx->host, ctx->port,
-                             c->resp.status, c->resp.payload);
+                             c->resp.status,
+                             (int) c->resp.payload_size,
+                             c->resp.payload);
             }
             else {
                 flb_plg_info(ctx->ins, "%s:%i, HTTP status=%i",
                              ctx->host, ctx->port,
                              c->resp.status);
             }
+
+            out_ret = FLB_OK;
         }
     }
     else {
         flb_plg_error(ctx->ins, "could not flush records to %s:%i (http_do=%i)",
                       ctx->host, ctx->port, ret);
+
         out_ret = FLB_RETRY;
     }
 
-    /*
-     * If the payload buffer is different than incoming records in body, means
-     * we generated a different payload and must be freed.
-     */
-    if (final_body != body) {
+    if (compressed) {
         flb_free(final_body);
     }
+
     /* Destroy HTTP client context */
     flb_http_client_destroy(c);
 
@@ -271,6 +237,217 @@ static int http_post(struct opentelemetry_context *ctx,
 
     return out_ret;
 }
+
+int opentelemetry_post(struct opentelemetry_context *ctx,
+                       const void *body, size_t body_len,
+                       const char *tag, int tag_len,
+                       const char *http_uri,
+                       const char *grpc_uri)
+{
+    const char               *compression_algorithm;
+    uint32_t                  wire_message_length;
+    size_t                    grpc_body_length;
+    cfl_sds_t                 sds_result;
+    cfl_sds_t                 grpc_body;
+    struct flb_http_response *response;
+    struct flb_http_request  *request;
+    int                       out_ret;
+    int                       result;
+
+    if (!ctx->enable_http2_flag) {
+        return opentelemetry_legacy_post(ctx,
+                                         body, body_len,
+                                         tag, tag_len,
+                                         http_uri);
+    }
+
+    compression_algorithm = NULL;
+
+    request = flb_http_client_request_builder(
+                    &ctx->http_client,
+                    FLB_HTTP_CLIENT_ARGUMENT_METHOD(FLB_HTTP_POST),
+                    FLB_HTTP_CLIENT_ARGUMENT_HOST(ctx->host),
+                    FLB_HTTP_CLIENT_ARGUMENT_USER_AGENT("Fluent-Bit"),
+                    FLB_HTTP_CLIENT_ARGUMENT_HEADERS(
+                        FLB_HTTP_CLIENT_HEADER_CONFIG_MAP_LIST,
+                        ctx->headers));
+
+    if (request == NULL) {
+        flb_plg_error(ctx->ins, "error initializing http request");
+
+        return FLB_RETRY;
+    }
+
+    if (request->protocol_version == HTTP_PROTOCOL_VERSION_20 &&
+        ctx->enable_grpc_flag) {
+
+        grpc_body = cfl_sds_create_size(body_len + 5);
+
+        if (grpc_body == NULL) {
+            flb_http_client_request_destroy(request, FLB_TRUE);
+
+            return FLB_RETRY;
+        }
+
+        wire_message_length = (uint32_t) body_len;
+
+        sds_result = cfl_sds_cat(grpc_body, "\x00----", 5);
+
+        if (sds_result == NULL) {
+            flb_http_client_request_destroy(request, FLB_TRUE);
+
+            cfl_sds_destroy(grpc_body);
+
+            return FLB_RETRY;
+        }
+
+        grpc_body = sds_result;
+
+        ((uint8_t *) grpc_body)[1] = (wire_message_length & 0xFF000000) >> 24;
+        ((uint8_t *) grpc_body)[2] = (wire_message_length & 0x00FF0000) >> 16;
+        ((uint8_t *) grpc_body)[3] = (wire_message_length & 0x0000FF00) >> 8;
+        ((uint8_t *) grpc_body)[4] = (wire_message_length & 0x000000FF) >> 0;
+
+        sds_result = cfl_sds_cat(grpc_body, body, body_len);
+
+        if (sds_result == NULL) {
+            flb_http_client_request_destroy(request, FLB_TRUE);
+
+            cfl_sds_destroy(grpc_body);
+
+            return FLB_RETRY;
+        }
+
+        grpc_body = sds_result;
+
+        grpc_body_length = cfl_sds_len(grpc_body);
+
+        result = flb_http_request_set_parameters(request,
+                    FLB_HTTP_CLIENT_ARGUMENT_URI(grpc_uri),
+                    FLB_HTTP_CLIENT_ARGUMENT_CONTENT_TYPE(
+                    "application/grpc"),
+                    FLB_HTTP_CLIENT_ARGUMENT_BODY(grpc_body,
+                                                  grpc_body_length,
+                                                  compression_algorithm));
+
+        cfl_sds_destroy(grpc_body);
+
+        if (result  != 0) {
+            flb_http_client_request_destroy(request, FLB_TRUE);
+
+            return FLB_RETRY;
+        }
+    }
+    else {
+        if (ctx->compress_gzip == FLB_TRUE) {
+            compression_algorithm = "gzip";
+        }
+        else if (ctx->compress_zstd == FLB_TRUE) {
+            compression_algorithm = "zstd";
+        }
+
+        result = flb_http_request_set_parameters(request,
+                        FLB_HTTP_CLIENT_ARGUMENT_URI(http_uri),
+                        FLB_HTTP_CLIENT_ARGUMENT_CONTENT_TYPE(
+                            FLB_OPENTELEMETRY_MIME_PROTOBUF_LITERAL),
+                        FLB_HTTP_CLIENT_ARGUMENT_BODY(body,
+                                                      body_len,
+                                                      compression_algorithm));
+
+        if (result  != 0) {
+            flb_http_client_request_destroy(request, FLB_TRUE);
+
+            return FLB_RETRY;
+        }
+    }
+
+    if (ctx->http_user != NULL &&
+        ctx->http_passwd != NULL) {
+        result = flb_http_request_set_parameters(request,
+                    FLB_HTTP_CLIENT_ARGUMENT_BASIC_AUTHORIZATION(
+                                                    ctx->http_user,
+                                                    ctx->http_passwd));
+
+        if (result  != 0) {
+            flb_plg_error(ctx->ins, "error setting http authorization data");
+
+            return FLB_RETRY;
+        }
+
+        flb_http_request_set_authorization(request,
+                                           HTTP_WWW_AUTHORIZATION_SCHEME_BASIC,
+                                           ctx->http_user,
+                                           ctx->http_passwd);
+    }
+
+    response = flb_http_client_request_execute(request);
+    if (response == NULL) {
+        flb_plg_warn(ctx->ins, "error performing HTTP request, remote host=%s:%i connection error",
+                     ctx->host, ctx->port);
+        flb_http_client_request_destroy(request, FLB_TRUE);
+
+        return FLB_RETRY;
+    }
+
+    /*
+     * Only allow the following HTTP status:
+     *
+     * - 200: OK
+     * - 201: Created
+     * - 202: Accepted
+     * - 203: no authorative resp
+     * - 204: No Content
+     * - 205: Reset content
+     *
+     */
+    if (response->status < 200 || response->status > 205) {
+        if (ctx->log_response_payload &&
+            response->body != NULL &&
+            cfl_sds_len(response->body) > 0) {
+            flb_plg_error(ctx->ins,
+                          "%s:%i, HTTP status=%i\n%s",
+                          ctx->host,
+                          ctx->port,
+                          response->status,
+                          response->body);
+        }
+        else {
+            flb_plg_error(ctx->ins,
+                          "%s:%i, HTTP status=%i",
+                          ctx->host,
+                          ctx->port,
+                          response->status);
+        }
+
+        out_ret = FLB_RETRY;
+    }
+    else {
+        if (ctx->log_response_payload &&
+            response->body != NULL &&
+            cfl_sds_len(response->body) > 0) {
+            flb_plg_info(ctx->ins, "%s:%i, HTTP status=%i%s",
+                            ctx->host, ctx->port,
+                            response->status, response->body);
+        }
+        else {
+            flb_plg_info(ctx->ins, "%s:%i, HTTP status=%i",
+                            ctx->host, ctx->port,
+                            response->status);
+        }
+
+        out_ret = FLB_OK;
+    }
+
+    flb_http_client_request_destroy(request, FLB_TRUE);
+
+    return out_ret;
+}
+
+int otel_process_logs(struct flb_event_chunk *event_chunk,
+                      struct flb_output_flush *out_flush,
+                      struct flb_input_instance *ins, void *out_context,
+                      struct flb_config *config);
+
 
 static void append_labels(struct opentelemetry_context *ctx,
                           struct cmt *cmt)
@@ -284,533 +461,32 @@ static void append_labels(struct opentelemetry_context *ctx,
     }
 }
 
-static void clear_array(Opentelemetry__Proto__Logs__V1__LogRecord **logs,
-                        size_t log_count)
+static int opentelemetry_format_test(struct flb_config *config,
+                                     struct flb_input_instance *ins,
+                                     void *plugin_context,
+                                     void *flush_ctx,
+                                     int event_type,
+                                     const char *tag, int tag_len,
+                                     const void *data, size_t bytes,
+                                     void **out_data, size_t *out_size)
 {
-    size_t index;
+    if (event_type == FLB_INPUT_LOGS) {
 
-    if (logs == NULL){
-        return;
+    }
+    else if (event_type == FLB_INPUT_METRICS) {
+
+    }
+    else if (event_type == FLB_INPUT_TRACES) {
+
     }
 
-    for (index = 0 ; index < log_count ; index++) {
-        otlp_any_value_destroy(logs[index]->body);
-        flb_free(logs[index]);
-    }
-
-    flb_free(logs);
-}
-
-static Opentelemetry__Proto__Common__V1__ArrayValue *otlp_array_value_initialize(size_t entry_count)
-{
-    Opentelemetry__Proto__Common__V1__ArrayValue *value;
-
-    value = flb_calloc(1, sizeof(Opentelemetry__Proto__Common__V1__ArrayValue));
-
-    if (value != NULL) {
-        opentelemetry__proto__common__v1__array_value__init(value);
-
-        if (entry_count > 0) {
-            value->values = \
-                flb_calloc(entry_count,
-                       sizeof(Opentelemetry__Proto__Common__V1__AnyValue *));
-
-            if (value->values == NULL) {
-                flb_free(value);
-
-                value = NULL;
-            }
-            else {
-                value->n_values = entry_count;
-            }
-        }
-    }
-
-    return value;
-}
-
-static Opentelemetry__Proto__Common__V1__KeyValue *otlp_kvpair_value_initialize()
-{
-    Opentelemetry__Proto__Common__V1__KeyValue *value;
-
-    value = flb_calloc(1, sizeof(Opentelemetry__Proto__Common__V1__KeyValue));
-
-    if (value != NULL) {
-        opentelemetry__proto__common__v1__key_value__init(value);
-    }
-
-    return value;
-}
-
-static Opentelemetry__Proto__Common__V1__KeyValueList *otlp_kvlist_value_initialize(size_t entry_count)
-{
-    Opentelemetry__Proto__Common__V1__KeyValueList *value;
-
-    value = flb_calloc(1, sizeof(Opentelemetry__Proto__Common__V1__KeyValueList));
-
-    if (value != NULL) {
-        opentelemetry__proto__common__v1__key_value_list__init(value);
-
-        if (entry_count > 0) {
-            value->values = \
-                flb_calloc(entry_count,
-                       sizeof(Opentelemetry__Proto__Common__V1__KeyValue *));
-
-            if (value->values == NULL) {
-                flb_free(value);
-
-                value = NULL;
-            }
-            else {
-                value->n_values = entry_count;
-            }
-        }
-    }
-
-    return value;
-}
-
-static Opentelemetry__Proto__Common__V1__AnyValue *otlp_any_value_initialize(int data_type, size_t entry_count)
-{
-    Opentelemetry__Proto__Common__V1__AnyValue *value;
-
-    value = flb_calloc(1, sizeof(Opentelemetry__Proto__Common__V1__AnyValue));
-
-    if (value == NULL) {
-        return NULL;
-    }
-
-    opentelemetry__proto__common__v1__any_value__init(value);
-
-    if (data_type == MSGPACK_OBJECT_STR) {
-        value->value_case = OPENTELEMETRY__PROTO__COMMON__V1__ANY_VALUE__VALUE_STRING_VALUE;
-    }
-    else if (data_type == MSGPACK_OBJECT_BOOLEAN) {
-        value->value_case = OPENTELEMETRY__PROTO__COMMON__V1__ANY_VALUE__VALUE_BOOL_VALUE;
-    }
-    else if (data_type == MSGPACK_OBJECT_POSITIVE_INTEGER || data_type == MSGPACK_OBJECT_NEGATIVE_INTEGER) {
-        value->value_case = OPENTELEMETRY__PROTO__COMMON__V1__ANY_VALUE__VALUE_INT_VALUE;
-    }
-    else if (data_type == MSGPACK_OBJECT_FLOAT32 || data_type == MSGPACK_OBJECT_FLOAT64) {
-        value->value_case = OPENTELEMETRY__PROTO__COMMON__V1__ANY_VALUE__VALUE_DOUBLE_VALUE;
-    }
-    else if (data_type == MSGPACK_OBJECT_ARRAY) {
-        value->value_case = OPENTELEMETRY__PROTO__COMMON__V1__ANY_VALUE__VALUE_ARRAY_VALUE;
-        value->array_value = otlp_array_value_initialize(entry_count);
-
-        if (value->array_value == NULL) {
-            flb_free(value);
-            value = NULL;
-        }
-    }
-    else if (data_type == MSGPACK_OBJECT_MAP) {
-        value->value_case = OPENTELEMETRY__PROTO__COMMON__V1__ANY_VALUE__VALUE_KVLIST_VALUE;
-
-        value->kvlist_value = otlp_kvlist_value_initialize(entry_count);
-
-        if (value->kvlist_value == NULL) {
-            flb_free(value);
-
-            value = NULL;
-        }
-    }
-    else if (data_type == MSGPACK_OBJECT_BIN) {
-        value->value_case = OPENTELEMETRY__PROTO__COMMON__V1__ANY_VALUE__VALUE_BYTES_VALUE;
-    }
-    else {
-        flb_free(value);
-
-        value = NULL;
-    }
-
-    return value;
-}
-
-static inline Opentelemetry__Proto__Common__V1__AnyValue *msgpack_boolean_to_otlp_any_value(struct msgpack_object *o)
-{
-    Opentelemetry__Proto__Common__V1__AnyValue *result;
-
-    result = otlp_any_value_initialize(MSGPACK_OBJECT_BOOLEAN, 0);
-
-    if (result != NULL) {
-        result->bool_value = o->via.boolean;
-    }
-
-    return result;
-}
-
-static inline Opentelemetry__Proto__Common__V1__AnyValue *msgpack_integer_to_otlp_any_value(struct msgpack_object *o)
-{
-    Opentelemetry__Proto__Common__V1__AnyValue *result;
-
-    result = otlp_any_value_initialize(o->type, 0);
-
-    if (result != NULL) {
-        if (o->type == MSGPACK_OBJECT_POSITIVE_INTEGER) {
-            result->int_value = (int64_t) o->via.u64;
-        }
-        else {
-            result->int_value = o->via.i64;
-        }
-    }
-
-    return result;
-}
-
-static inline Opentelemetry__Proto__Common__V1__AnyValue *msgpack_float_to_otlp_any_value(struct msgpack_object *o)
-{
-    Opentelemetry__Proto__Common__V1__AnyValue *result;
-
-    result = otlp_any_value_initialize(o->type, 0);
-
-    if (result != NULL) {
-        result->double_value = o->via.f64;
-    }
-
-    return result;
-}
-
-static inline Opentelemetry__Proto__Common__V1__AnyValue *msgpack_string_to_otlp_any_value(struct msgpack_object *o)
-{
-    Opentelemetry__Proto__Common__V1__AnyValue *result;
-
-    result = otlp_any_value_initialize(MSGPACK_OBJECT_STR, 0);
-
-    if (result != NULL) {
-        result->string_value = flb_strndup(o->via.str.ptr, o->via.str.size);
-
-        if (result->string_value == NULL) {
-            otlp_any_value_destroy(result);
-
-            result = NULL;
-        }
-    }
-
-    return result;
-}
-
-static inline Opentelemetry__Proto__Common__V1__AnyValue *msgpack_bin_to_otlp_any_value(struct msgpack_object *o)
-{
-    Opentelemetry__Proto__Common__V1__AnyValue *result;
-
-    result = otlp_any_value_initialize(MSGPACK_OBJECT_BIN, 0);
-
-    if (result != NULL) {
-        result->bytes_value.len = o->via.bin.size;
-        result->bytes_value.data = flb_malloc(o->via.bin.size);
-
-        if (result->bytes_value.data == NULL) {
-            otlp_any_value_destroy(result);
-
-            result = NULL;
-        }
-
-        memcpy(result->bytes_value.data, o->via.bin.ptr, o->via.bin.size);
-    }
-
-    return result;
-}
-
-static inline Opentelemetry__Proto__Common__V1__AnyValue *msgpack_array_to_otlp_any_value(struct msgpack_object *o)
-{
-    size_t                                      entry_count;
-    Opentelemetry__Proto__Common__V1__AnyValue *entry_value;
-    Opentelemetry__Proto__Common__V1__AnyValue *result;
-    size_t                                      index;
-    msgpack_object                             *p;
-
-    entry_count = o->via.array.size;
-    result = otlp_any_value_initialize(MSGPACK_OBJECT_ARRAY, entry_count);
-
-    p = o->via.array.ptr;
-
-    if (result != NULL) {
-        index = 0;
-
-        for (index = 0 ; index < entry_count ; index++) {
-            entry_value = msgpack_object_to_otlp_any_value(&p[index]);
-
-            if (entry_value == NULL) {
-                otlp_any_value_destroy(result);
-
-                result = NULL;
-
-                break;
-            }
-
-            result->array_value->values[index] = entry_value;
-        }
-    }
-
-    return result;
-}
-
-static inline Opentelemetry__Proto__Common__V1__KeyValue *msgpack_kv_to_otlp_any_value(struct msgpack_object_kv *input_pair)
-{
-    Opentelemetry__Proto__Common__V1__KeyValue *kv;
-
-    kv = otlp_kvpair_value_initialize();
-    if (kv == NULL) {
-        flb_errno();
-        return NULL;
-    }
-
-    kv->key = flb_strndup(input_pair->key.via.str.ptr, input_pair->key.via.str.size);
-    if (kv->key == NULL) {
-        flb_errno();
-        flb_free(kv);
-        return NULL;
-    }
-
-    kv->value = msgpack_object_to_otlp_any_value(&input_pair->val);
-    if (kv->value == NULL) {
-        flb_errno();
-        flb_free(kv->key);
-        flb_free(kv);
-        return NULL;
-    }
-
-    return kv;
-}
-
-static inline Opentelemetry__Proto__Common__V1__AnyValue *msgpack_map_to_otlp_any_value(struct msgpack_object *o)
-{
-    size_t                                      entry_count;
-    Opentelemetry__Proto__Common__V1__AnyValue *result;
-    Opentelemetry__Proto__Common__V1__KeyValue *keyvalue;
-    size_t                                      index;
-    msgpack_object_kv                          *kv;
-
-    entry_count = o->via.map.size;
-    result = otlp_any_value_initialize(MSGPACK_OBJECT_MAP, entry_count);
-
-    if (result != NULL) {
-
-        for (index = 0; index < entry_count; index++) {
-            kv = &o->via.map.ptr[index];
-            keyvalue = msgpack_kv_to_otlp_any_value(kv);
-            result->kvlist_value->values[index] = keyvalue;
-        }
-    }
-
-    return result;
-}
-
-static inline Opentelemetry__Proto__Common__V1__AnyValue *msgpack_object_to_otlp_any_value(struct msgpack_object *o)
-{
-    Opentelemetry__Proto__Common__V1__AnyValue *result;
-
-    switch (o->type) {
-
-        case MSGPACK_OBJECT_BOOLEAN:
-            result = msgpack_boolean_to_otlp_any_value(o);
-            break;
-
-        case MSGPACK_OBJECT_POSITIVE_INTEGER:
-        case MSGPACK_OBJECT_NEGATIVE_INTEGER:
-            result = msgpack_integer_to_otlp_any_value(o);
-            break;
-
-        case MSGPACK_OBJECT_FLOAT32:
-        case MSGPACK_OBJECT_FLOAT64:
-            result = msgpack_float_to_otlp_any_value(o);
-            break;
-
-        case MSGPACK_OBJECT_STR:
-            result = msgpack_string_to_otlp_any_value(o);
-            break;
-
-        case MSGPACK_OBJECT_BIN:
-            result = msgpack_bin_to_otlp_any_value(o);
-            break;
-
-        case MSGPACK_OBJECT_ARRAY:
-            result = msgpack_array_to_otlp_any_value(o);
-            break;
-
-        case MSGPACK_OBJECT_MAP:
-            result = msgpack_map_to_otlp_any_value(o);
-            break;
-
-        default:
-            break;
-    }
-
-    return result;
-}
-
-static int flush_to_otel(struct opentelemetry_context *ctx,
-                         struct flb_event_chunk *event_chunk,
-                         Opentelemetry__Proto__Logs__V1__LogRecord **logs,
-                         size_t log_count)
-{
-    Opentelemetry__Proto__Collector__Logs__V1__ExportLogsServiceRequest export_logs;
-    Opentelemetry__Proto__Logs__V1__ScopeLogs scope_log;
-    Opentelemetry__Proto__Logs__V1__ResourceLogs resource_log;
-    Opentelemetry__Proto__Logs__V1__ResourceLogs *resource_logs[1];
-    Opentelemetry__Proto__Logs__V1__ScopeLogs *scope_logs[1];
-    void *body;
-    unsigned len;
-    int res;
-
-    opentelemetry__proto__collector__logs__v1__export_logs_service_request__init(&export_logs);
-    opentelemetry__proto__logs__v1__resource_logs__init(&resource_log);
-    opentelemetry__proto__logs__v1__scope_logs__init(&scope_log);
-
-    scope_log.log_records = logs;
-    scope_log.n_log_records = log_count;
-    scope_logs[0] = &scope_log;
-
-    resource_log.scope_logs =  scope_logs;
-    resource_log.n_scope_logs = 1;
-    resource_logs[0] = &resource_log;
-
-    export_logs.resource_logs = resource_logs;
-    export_logs.n_resource_logs = 1;
-
-    len = opentelemetry__proto__collector__logs__v1__export_logs_service_request__get_packed_size(&export_logs);
-    body = flb_calloc(len, sizeof(char));
-    if (!body) {
-        flb_errno();
-        return FLB_ERROR;
-    }
-
-    opentelemetry__proto__collector__logs__v1__export_logs_service_request__pack(&export_logs, body);
-
-    // send post request to opentelemetry with content type application/x-protobuf
-    res = http_post(ctx, body, len,
-                    event_chunk->tag,
-                    flb_sds_len(event_chunk->tag),
-                    ctx->logs_uri);
-
-    flb_free(body);
-
-    return res;
-}
-
-static int process_logs(struct flb_event_chunk *event_chunk,
-                        struct flb_output_flush *out_flush,
-                        struct flb_input_instance *ins, void *out_context,
-                        struct flb_config *config)
-{
-    struct opentelemetry_context *ctx;
-    ctx = out_context;
-
-    /*
-    * These were initially variable length arrays.
-    * However, having a high value for batch_size was causing memory
-    * issues with the event chunk being overwritten. Moving it to the heap
-    * solves these issues but we still do not know the root cause
-    */
-
-    Opentelemetry__Proto__Logs__V1__LogRecord **log_record_list;
-    Opentelemetry__Proto__Logs__V1__LogRecord *log_records;
-    Opentelemetry__Proto__Common__V1__AnyValue *log_bodies;
-    Opentelemetry__Proto__Common__V1__AnyValue *log_object;
-
-    size_t log_record_count;
-    size_t index;
-    msgpack_unpacked result;
-    msgpack_object *obj;
-    size_t off = 0;
-    struct flb_time tm;
-    int res = FLB_OK;
-
-    log_record_list = (Opentelemetry__Proto__Logs__V1__LogRecord *) flb_calloc(ctx->batch_size, sizeof(Opentelemetry__Proto__Logs__V1__LogRecord *));
-    if (!log_record_list) {
-        flb_errno();
-        return -1;
-    }
-
-    log_records = flb_calloc(ctx->batch_size, sizeof(Opentelemetry__Proto__Logs__V1__LogRecord));
-    if (!log_records) {
-        flb_free(log_record_list);
-        flb_errno();
-        return -1;
-    }
-
-    log_bodies = (Opentelemetry__Proto__Common__V1__AnyValue *) flb_calloc(ctx->batch_size, sizeof(Opentelemetry__Proto__Common__V1__AnyValue));
-    if (!log_bodies) {
-        flb_free(log_record_list);
-        flb_free(log_records);
-        flb_errno();
-        return -1;
-    }
-
-    for(index = 0 ; index < ctx->batch_size ; index++) {
-        opentelemetry__proto__logs__v1__log_record__init(&log_records[index]);
-        opentelemetry__proto__common__v1__any_value__init(&log_bodies[index]);
-
-        log_records[index].body = &log_bodies[index];
-        log_record_list[index] = &log_records[index];
-    }
-    log_record_count = 0;
-
-    msgpack_unpacked_init(&result);
-
-    while (msgpack_unpack_next(&result,
-                                event_chunk->data,
-                                event_chunk->size, &off) == MSGPACK_UNPACK_SUCCESS) {
-
-        if (result.data.type != MSGPACK_OBJECT_ARRAY) {
-            continue;
-        }
-
-        if (result.data.via.array.size != 2){
-            continue;
-        }
-
-        /* unpack the array of [timestamp, map] */
-        flb_time_pop_from_msgpack(&tm, &result, &obj);
-
-        if (obj->type != MSGPACK_OBJECT_MAP) {
-            continue;
-        }
-
-        log_object = msgpack_object_to_otlp_any_value(obj);
-
-        log_records[log_record_count].body = log_object;
-        log_records[log_record_count].time_unix_nano = flb_time_to_nanosec(&tm);
-
-        log_record_count++;
-
-        if (log_record_count >= ctx->batch_size) {
-            res = flush_to_otel(ctx,
-                                event_chunk,
-                                log_record_list,
-                                log_record_count);
-
-            clear_array(log_record_list, log_record_count);
-
-            log_record_count = 0;
-
-            if (res != FLB_OK) {
-                return res;
-            }
-        }
-    }
-
-    if (log_record_count >= 0) {
-        res = flush_to_otel(ctx,
-                            event_chunk,
-                            log_record_list,
-                            log_record_count);
-
-        clear_array(log_record_list, log_record_count);
-
-        log_record_count = 0;
-    }
-
-    flb_free(log_bodies);
-    msgpack_unpacked_destroy(&result);
-
-    return res;
+    return 0;
 }
 
 static int process_metrics(struct flb_event_chunk *event_chunk,
-                    struct flb_output_flush *out_flush,
-                    struct flb_input_instance *ins, void *out_context,
-                    struct flb_config *config)
+                           struct flb_output_flush *out1_flush,
+                           struct flb_input_instance *ins, void *out_context,
+                           struct flb_config *config)
 {
     int c = 0;
     int ok;
@@ -852,6 +528,7 @@ static int process_metrics(struct flb_event_chunk *event_chunk,
             flb_plg_error(ctx->ins,
                           "Error encoding context as opentelemetry");
             result = FLB_ERROR;
+            cmt_destroy(cmt);
             goto exit;
         }
 
@@ -872,10 +549,11 @@ static int process_metrics(struct flb_event_chunk *event_chunk,
         flb_plg_debug(ctx->ins, "final payload size: %lu", flb_sds_len(buf));
         if (buf && flb_sds_len(buf) > 0) {
             /* Send HTTP request */
-            result = http_post(ctx, buf, flb_sds_len(buf),
-                               event_chunk->tag,
-                               flb_sds_len(event_chunk->tag),
-                               ctx->metrics_uri);
+            result = opentelemetry_post(ctx, buf, flb_sds_len(buf),
+                                        event_chunk->tag,
+                                        flb_sds_len(event_chunk->tag),
+                                        ctx->metrics_uri_sanitized,
+                                        ctx->grpc_metrics_uri);
 
             /* Debug http_post() result statuses */
             if (result == FLB_OK) {
@@ -894,6 +572,7 @@ static int process_metrics(struct flb_event_chunk *event_chunk,
     }
     else {
         flb_plg_error(ctx->ins, "Error decoding msgpack encoded context");
+        flb_sds_destroy(buf);
         return FLB_ERROR;
     }
 
@@ -909,7 +588,6 @@ static int process_traces(struct flb_event_chunk *event_chunk,
                           struct flb_input_instance *ins, void *out_context,
                           struct flb_config *config)
 {
-    int ok;
     int ret;
     int result;
     cfl_sds_t encoded_chunk;
@@ -920,7 +598,6 @@ static int process_traces(struct flb_event_chunk *event_chunk,
 
     /* Initialize vars */
     ctx = out_context;
-    ok = 0;
     result = FLB_OK;
 
     buf = flb_sds_create_size(event_chunk->size);
@@ -932,36 +609,42 @@ static int process_traces(struct flb_event_chunk *event_chunk,
     flb_plg_debug(ctx->ins, "ctraces msgpack size: %lu",
                   event_chunk->size);
 
-    ret = ctr_decode_msgpack_create(&ctr,
-                                    (char *) event_chunk->data,
-                                    event_chunk->size, &off);
-    if  (ret != ok) {
-        flb_plg_error(ctx->ins, "Error decoding msgpack encoded context");
+    while (ctr_decode_msgpack_create(&ctr,
+                                     (char *) event_chunk->data,
+                                     event_chunk->size, &off) == 0) {
+        /* Create a OpenTelemetry payload */
+        encoded_chunk = ctr_encode_opentelemetry_create(ctr);
+        if (encoded_chunk == NULL) {
+            flb_plg_error(ctx->ins,
+                          "Error encoding context as opentelemetry");
+            result = FLB_ERROR;
+            ctr_destroy(ctr);
+            goto exit;
+        }
+
+        /* concat buffer */
+        ret = flb_sds_cat_safe(&buf, encoded_chunk, flb_sds_len(encoded_chunk));
+        if (ret != 0) {
+            flb_plg_error(ctx->ins, "Error appending encoded trace to buffer");
+            result = FLB_ERROR;
+            ctr_encode_opentelemetry_destroy(encoded_chunk);
+            ctr_destroy(ctr);
+            goto exit;
+        }
+
+        /* release */
+        ctr_encode_opentelemetry_destroy(encoded_chunk);
+        ctr_destroy(ctr);
     }
-
-    /* Create a OpenTelemetry payload */
-    encoded_chunk = ctr_encode_opentelemetry_create(ctr);
-    if (encoded_chunk == NULL) {
-        flb_plg_error(ctx->ins,
-                      "Error encoding context as opentelemetry");
-        result = FLB_ERROR;
-        goto exit;
-    }
-
-    /* concat buffer */
-    flb_sds_cat_safe(&buf, encoded_chunk, flb_sds_len(encoded_chunk));
-
-    /* release */
-    ctr_encode_opentelemetry_destroy(encoded_chunk);
-    ctr_destroy(ctr);
 
     flb_plg_debug(ctx->ins, "final payload size: %lu", flb_sds_len(buf));
     if (buf && flb_sds_len(buf) > 0) {
         /* Send HTTP request */
-        result = http_post(ctx, buf, flb_sds_len(buf),
-                           event_chunk->tag,
-                           flb_sds_len(event_chunk->tag),
-                           ctx->traces_uri);
+        result = opentelemetry_post(ctx, buf, flb_sds_len(buf),
+                                    event_chunk->tag,
+                                    flb_sds_len(event_chunk->tag),
+                                    ctx->traces_uri_sanitized,
+                                    ctx->grpc_traces_uri);
 
         /* Debug http_post() result statuses */
         if (result == FLB_OK) {
@@ -974,8 +657,6 @@ static int process_traces(struct flb_event_chunk *event_chunk,
             flb_plg_debug(ctx->ins, "http_post result FLB_RETRY");
         }
     }
-    flb_sds_destroy(buf);
-    buf = NULL;
 
 exit:
     if (buf) {
@@ -1012,6 +693,12 @@ static int cb_opentelemetry_init(struct flb_output_instance *ins,
 
     flb_output_set_context(ins, ctx);
 
+    /*
+     * This plugin instance uses the HTTP client interface, let's register
+     * it debugging callbacks.
+     */
+    flb_output_set_http_debug_callbacks(ins);
+
     return 0;
 }
 
@@ -1022,15 +709,16 @@ static void cb_opentelemetry_flush(struct flb_event_chunk *event_chunk,
 {
     int result = FLB_RETRY;
 
-        if (event_chunk->type == FLB_INPUT_METRICS){
-            result = process_metrics(event_chunk, out_flush, ins, out_context, config);
-        }
-        else if (event_chunk->type == FLB_INPUT_LOGS){
-            result = process_logs(event_chunk, out_flush, ins, out_context, config);
-        }
-        else if (event_chunk->type == FLB_INPUT_TRACES){
-            result = process_traces(event_chunk, out_flush, ins, out_context, config);
-        }
+    if (event_chunk->type == FLB_INPUT_METRICS){
+        result = process_metrics(event_chunk, out_flush, ins, out_context, config);
+    }
+    else if (event_chunk->type == FLB_INPUT_LOGS){
+        result = otel_process_logs(event_chunk, out_flush, ins, out_context, config);
+    }
+    else if (event_chunk->type == FLB_INPUT_TRACES){
+        result = process_traces(event_chunk, out_flush, ins, out_context, config);
+    }
+
     FLB_OUTPUT_RETURN(result);
 }
 
@@ -1042,7 +730,16 @@ static struct flb_config_map config_map[] = {
                                              add_labels),
      "Adds a custom label to the metrics use format: 'add_label name value'"
     },
-
+    {
+     FLB_CONFIG_MAP_STR, "http2", "off",
+     0, FLB_TRUE, offsetof(struct opentelemetry_context, enable_http2),
+     "Enable, disable or force HTTP/2 usage. Accepted values : on, off, force"
+    },
+    {
+     FLB_CONFIG_MAP_BOOL, "grpc", "off",
+     0, FLB_TRUE, offsetof(struct opentelemetry_context, enable_grpc_flag),
+     "Enable, disable or force gRPC usage. Accepted values : on, off, auto"
+    },
     {
      FLB_CONFIG_MAP_STR, "proxy", NULL,
      0, FLB_FALSE, 0,
@@ -1069,20 +766,11 @@ static struct flb_config_map config_map[] = {
      "Specify an optional HTTP URI for the target OTel endpoint."
     },
     {
-     FLB_CONFIG_MAP_STR, "logs_uri", "/v1/logs",
-     0, FLB_TRUE, offsetof(struct opentelemetry_context, logs_uri),
-     "Specify an optional HTTP URI for the target OTel endpoint."
+     FLB_CONFIG_MAP_STR, "grpc_metrics_uri", "/opentelemetry.proto.collector.metrics.v1.MetricsService/Export",
+     0, FLB_TRUE, offsetof(struct opentelemetry_context, grpc_metrics_uri),
+     "Specify an optional gRPC URI for the target OTel endpoint."
     },
-    {
-     FLB_CONFIG_MAP_STR, "traces_uri", "/v1/traces",
-     0, FLB_TRUE, offsetof(struct opentelemetry_context, traces_uri),
-     "Specify an optional HTTP URI for the target OTel endpoint."
-    },
-    {
-     FLB_CONFIG_MAP_BOOL, "log_response_payload", "true",
-     0, FLB_TRUE, offsetof(struct opentelemetry_context, log_response_payload),
-     "Specify if the response paylod should be logged or not"
-    },
+
     {
       FLB_CONFIG_MAP_INT, "batch_size", DEFAULT_LOG_RECORD_BATCH_SIZE,
       0, FLB_TRUE, offsetof(struct opentelemetry_context, batch_size),
@@ -1091,8 +779,129 @@ static struct flb_config_map config_map[] = {
     {
      FLB_CONFIG_MAP_STR, "compress", NULL,
      0, FLB_FALSE, 0,
-     "Set payload compression mechanism. Option available is 'gzip'"
+     "Set payload compression mechanism. Options available are 'gzip' and 'zstd'."
     },
+    /*
+     * Logs Properties
+     * ---------------
+     */
+    {
+     FLB_CONFIG_MAP_STR, "logs_uri", "/v1/logs",
+     0, FLB_TRUE, offsetof(struct opentelemetry_context, logs_uri),
+     "Specify an optional HTTP URI for the target OTel endpoint."
+    },
+
+    {
+     FLB_CONFIG_MAP_STR, "grpc_logs_uri", "/opentelemetry.proto.collector.logs.v1.LogsService/Export",
+     0, FLB_TRUE, offsetof(struct opentelemetry_context, grpc_logs_uri),
+     "Specify an optional gRPCß URI for the target OTel endpoint."
+    },
+
+    {
+     FLB_CONFIG_MAP_STR, "logs_body_key", NULL,
+     FLB_CONFIG_MAP_MULT, FLB_TRUE, offsetof(struct opentelemetry_context, log_body_key_list_str),
+     "Specify an optional HTTP URI for the target OTel endpoint."
+    },
+
+    {
+     FLB_CONFIG_MAP_BOOL, "logs_body_key_attributes", "false",
+     0, FLB_TRUE, offsetof(struct opentelemetry_context, logs_body_key_attributes),
+     "If logs_body_key is set and it matched a pattern, this option will include the "
+     "remaining fields in the record as attributes."
+    },
+
+    {
+     FLB_CONFIG_MAP_STR, "traces_uri", "/v1/traces",
+     0, FLB_TRUE, offsetof(struct opentelemetry_context, traces_uri),
+     "Specify an optional HTTP URI for the target OTel endpoint."
+    },
+    {
+     FLB_CONFIG_MAP_STR, "grpc_traces_uri", "/opentelemetry.proto.collector.trace.v1.TraceService/Export",
+     0, FLB_TRUE, offsetof(struct opentelemetry_context, grpc_traces_uri),
+     "Specify an optional gRPC URI for the target OTel endpoint."
+    },
+
+    {
+     FLB_CONFIG_MAP_BOOL, "log_response_payload", "true",
+     0, FLB_TRUE, offsetof(struct opentelemetry_context, log_response_payload),
+     "Specify if the response payload should be logged or not"
+    },
+    {
+     FLB_CONFIG_MAP_STR, "logs_metadata_key", "otlp",
+     0, FLB_TRUE, offsetof(struct opentelemetry_context, logs_metadata_key),
+    },
+    {
+     FLB_CONFIG_MAP_STR, "logs_observed_timestamp_metadata_key", "$ObservedTimestamp",
+     0, FLB_TRUE, offsetof(struct opentelemetry_context, logs_observed_timestamp_metadata_key),
+     "Specify an ObservedTimestamp key"
+    },
+    {
+     FLB_CONFIG_MAP_STR, "logs_timestamp_metadata_key", "$Timestamp",
+     0, FLB_TRUE, offsetof(struct opentelemetry_context, logs_timestamp_metadata_key),
+     "Specify a Timestamp key"
+    },
+    {
+     FLB_CONFIG_MAP_STR, "logs_severity_text_metadata_key", "$SeverityText",
+     0, FLB_TRUE, offsetof(struct opentelemetry_context, logs_severity_text_metadata_key),
+     "Specify a SeverityText key"
+    },
+    {
+     FLB_CONFIG_MAP_STR, "logs_severity_number_metadata_key", "$SeverityNumber",
+     0, FLB_TRUE, offsetof(struct opentelemetry_context, logs_severity_number_metadata_key),
+     "Specify a SeverityNumber key"
+    },
+    {
+     FLB_CONFIG_MAP_STR, "logs_trace_flags_metadata_key", "$TraceFlags",
+     0, FLB_TRUE, offsetof(struct opentelemetry_context, logs_trace_flags_metadata_key),
+     "Specify a TraceFlags key"
+    },
+    {
+     FLB_CONFIG_MAP_STR, "logs_span_id_metadata_key", "$SpanId",
+     0, FLB_TRUE, offsetof(struct opentelemetry_context, logs_span_id_metadata_key),
+     "Specify a SpanId key"
+    },
+    {
+     FLB_CONFIG_MAP_STR, "logs_trace_id_metadata_key", "$TraceId",
+     0, FLB_TRUE, offsetof(struct opentelemetry_context, logs_trace_id_metadata_key),
+     "Specify a TraceId key"
+    },
+    {
+     FLB_CONFIG_MAP_STR, "logs_attributes_metadata_key", "$Attributes",
+     0, FLB_TRUE, offsetof(struct opentelemetry_context, logs_attributes_metadata_key),
+     "Specify an Attributes key"
+    },
+    {
+     FLB_CONFIG_MAP_STR, "logs_instrumentation_scope_metadata_key", "InstrumentationScope",
+     0, FLB_TRUE, offsetof(struct opentelemetry_context, logs_instrumentation_scope_metadata_key),
+     "Specify an InstrumentationScope key"
+    },
+    {
+     FLB_CONFIG_MAP_STR, "logs_resource_metadata_key", "Resource",
+     0, FLB_TRUE, offsetof(struct opentelemetry_context, logs_resource_metadata_key),
+     "Specify a Resource key"
+    },
+        {
+     FLB_CONFIG_MAP_STR, "logs_span_id_message_key", "$SpanId",
+     0, FLB_TRUE, offsetof(struct opentelemetry_context, logs_span_id_message_key),
+     "Specify a SpanId key"
+    },
+    {
+     FLB_CONFIG_MAP_STR, "logs_trace_id_message_key", "$TraceId",
+     0, FLB_TRUE, offsetof(struct opentelemetry_context, logs_trace_id_message_key),
+     "Specify a TraceId key"
+    },
+    {
+     FLB_CONFIG_MAP_STR, "logs_severity_text_message_key", "$SeverityText",
+     0, FLB_TRUE, offsetof(struct opentelemetry_context, logs_severity_text_message_key),
+     "Specify a Severity Text key"
+    },
+    {
+     FLB_CONFIG_MAP_STR, "logs_severity_number_message_key", "$SeverityNumber",
+     0, FLB_TRUE, offsetof(struct opentelemetry_context, logs_severity_number_message_key),
+     "Specify a Severity Number key"
+    },
+
+
     /* EOF */
     {0}
 };
@@ -1107,4 +916,6 @@ struct flb_output_plugin out_opentelemetry_plugin = {
     .config_map  = config_map,
     .event_type  = FLB_OUTPUT_LOGS | FLB_OUTPUT_METRICS | FLB_OUTPUT_TRACES,
     .flags       = FLB_OUTPUT_NET | FLB_IO_OPT_TLS,
+
+    .test_formatter.callback = opentelemetry_format_test,
 };

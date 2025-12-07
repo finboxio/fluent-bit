@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -26,6 +26,7 @@
 #include <fluent-bit/flb_gzip.h>
 #include <fluent-bit/flb_config_map.h>
 #include <fluent-bit/flb_version.h>
+#include <fluent-bit/flb_log_event_decoder.h>
 
 #include <msgpack.h>
 
@@ -98,17 +99,12 @@ static int datadog_format(struct flb_config *config,
     int ret;
     /* for msgpack global structs */
     size_t array_size = 0;
-    size_t off = 0;
-    msgpack_unpacked result;
     msgpack_sbuffer mp_sbuf;
     msgpack_packer mp_pck;
     /* for sub msgpack objs */
     int map_size;
-    struct flb_time tms;
     int64_t timestamp;
-    msgpack_object *obj;
     msgpack_object map;
-    msgpack_object root;
     msgpack_object k;
     msgpack_object v;
     struct flb_out_datadog *ctx = plugin_context;
@@ -118,16 +114,27 @@ static int datadog_format(struct flb_config *config,
     flb_sds_t out_buf;
     flb_sds_t remapped_tags = NULL;
     flb_sds_t tmp = NULL;
+    struct flb_log_event_decoder log_decoder;
+    struct flb_log_event log_event;
 
     /* in normal flush callback we have the event_chunk set as flush context
      * so we don't need to calculate the event len.
      * But in test mode the formatter won't get the event_chunk as flush_ctx
-     */ 
+     */
     if (flush_ctx != NULL) {
-        event_chunk = flush_ctx; 
+        event_chunk = flush_ctx;
         array_size = event_chunk->total_events;
     } else {
         array_size = flb_mp_count(data, bytes);
+    }
+
+    ret = flb_log_event_decoder_init(&log_decoder, (char *) data, bytes);
+
+    if (ret != FLB_EVENT_DECODER_SUCCESS) {
+        flb_plg_error(ctx->ins,
+                      "Log event decoder initialization error : %d", ret);
+
+        return -1;
     }
 
     /* Create temporary msgpack buffer */
@@ -137,16 +144,12 @@ static int datadog_format(struct flb_config *config,
     /* Prepare array for all entries */
     msgpack_pack_array(&mp_pck, array_size);
 
-    off = 0;
-    msgpack_unpacked_init(&result);
-    while (msgpack_unpack_next(&result, data, bytes, &off) == MSGPACK_UNPACK_SUCCESS) {
-        root = result.data;
+    while ((ret = flb_log_event_decoder_next(
+                    &log_decoder,
+                    &log_event)) == FLB_EVENT_DECODER_SUCCESS) {
+        timestamp = timestamp_format(&log_event.timestamp);
 
-        /* Get timestamp and object */
-        flb_time_pop_from_msgpack(&tms, &result, &obj);
-        timestamp = timestamp_format(&tms);
-
-        map = root.via.array.ptr[1];
+        map = *log_event.body;
         map_size = map.via.map.size;
 
         /*
@@ -176,16 +179,17 @@ static int datadog_format(struct flb_config *config,
                 if (!remapped_tags) {
                     flb_errno();
                     msgpack_sbuffer_destroy(&mp_sbuf);
-                    msgpack_unpacked_destroy(&result);
+                    flb_log_event_decoder_destroy(&log_decoder);
                     return -1;
                 }
-            } else if (flb_sds_len(remapped_tags) < byte_cnt) {
-                tmp = flb_sds_increase(remapped_tags, flb_sds_len(remapped_tags) - byte_cnt);
+            }
+            else if (flb_sds_len(remapped_tags) < byte_cnt) {
+                tmp = flb_sds_increase(remapped_tags, byte_cnt - flb_sds_len(remapped_tags));
                 if (!tmp) {
                     flb_errno();
                     flb_sds_destroy(remapped_tags);
                     msgpack_sbuffer_destroy(&mp_sbuf);
-                    msgpack_unpacked_destroy(&result);
+                    flb_log_event_decoder_destroy(&log_decoder);
                     return -1;
                 }
                 remapped_tags = tmp;
@@ -243,6 +247,14 @@ static int datadog_format(struct flb_config *config,
                                           ctx->dd_service, flb_sds_len(ctx->dd_service));
         }
 
+        /* dd_hostname */
+        if (ctx->dd_hostname != NULL) {
+            dd_msgpack_pack_key_value_str(&mp_pck,
+                                          FLB_DATADOG_DD_HOSTNAME_KEY,
+                                          sizeof(FLB_DATADOG_DD_HOSTNAME_KEY) -1,
+                                          ctx->dd_hostname, flb_sds_len(ctx->dd_hostname));
+        }
+
         /* Append initial object k/v */
         ind = 0;
         for (i = 0; i < map_size; i++) {
@@ -264,8 +276,7 @@ static int datadog_format(struct flb_config *config,
             }
 
             /* Mapping between input keys to specific datadog keys */
-            if (ctx->dd_message_key != NULL &&
-                dd_compare_msgpack_obj_key_with_str(k, ctx->dd_message_key,
+            if (dd_compare_msgpack_obj_key_with_str(k, ctx->dd_message_key,
                                                     flb_sds_len(ctx->dd_message_key)) == FLB_TRUE) {
                 msgpack_pack_str(&mp_pck, sizeof(FLB_DATADOG_DD_MESSAGE_KEY)-1);
                 msgpack_pack_str_body(&mp_pck, FLB_DATADOG_DD_MESSAGE_KEY,
@@ -281,25 +292,24 @@ static int datadog_format(struct flb_config *config,
         /* here we concatenate ctx->dd_tags and remapped_tags, depending on their presence */
         if (remap_cnt) {
             if (ctx->dd_tags != NULL) {
-                tmp = flb_sds_cat(remapped_tags, FLB_DATADOG_TAG_SEPERATOR,
-                                  strlen(FLB_DATADOG_TAG_SEPERATOR));
-                if (!tmp) {
+                ret = flb_sds_cat_safe(&remapped_tags, FLB_DATADOG_TAG_SEPERATOR,
+                                       strlen(FLB_DATADOG_TAG_SEPERATOR));
+                if (ret < 0) {
                     flb_errno();
                     flb_sds_destroy(remapped_tags);
                     msgpack_sbuffer_destroy(&mp_sbuf);
-                    msgpack_unpacked_destroy(&result);
+                    flb_log_event_decoder_destroy(&log_decoder);
                     return -1;
                 }
-                remapped_tags = tmp;
-                flb_sds_cat(remapped_tags, ctx->dd_tags, strlen(ctx->dd_tags));
-                if (!tmp) {
+
+                ret = flb_sds_cat_safe(&remapped_tags, ctx->dd_tags, strlen(ctx->dd_tags));
+                if (ret < 0) {
                     flb_errno();
                     flb_sds_destroy(remapped_tags);
                     msgpack_sbuffer_destroy(&mp_sbuf);
-                    msgpack_unpacked_destroy(&result);
+                    flb_log_event_decoder_destroy(&log_decoder);
                     return -1;
                 }
-                remapped_tags = tmp;
             }
             dd_msgpack_pack_key_value_str(&mp_pck,
                                           FLB_DATADOG_DD_TAGS_KEY,
@@ -323,7 +333,7 @@ static int datadog_format(struct flb_config *config,
         if (remapped_tags) {
             flb_sds_destroy(remapped_tags);
         }
-        msgpack_unpacked_destroy(&result);
+        flb_log_event_decoder_destroy(&log_decoder);
         return -1;
     }
 
@@ -331,7 +341,8 @@ static int datadog_format(struct flb_config *config,
     *out_size = flb_sds_len(out_buf);
 
     /* Cleanup */
-    msgpack_unpacked_destroy(&result);
+    flb_log_event_decoder_destroy(&log_decoder);
+
     if (remapped_tags) {
         flb_sds_destroy(remapped_tags);
     }
@@ -357,6 +368,10 @@ static void cb_datadog_flush(struct flb_event_chunk *event_chunk,
     size_t b_sent;
     int ret = FLB_ERROR;
     int compressed = FLB_FALSE;
+    struct mk_list *head;
+    struct flb_config_map_val *mv;
+    struct flb_slist_entry *key = NULL;
+    struct flb_slist_entry *val = NULL;
 
     /* Get upstream connection */
     upstream_conn = flb_upstream_conn_get(ctx->upstream);
@@ -416,7 +431,15 @@ static void cb_datadog_flush(struct flb_event_chunk *event_chunk,
     if (compressed == FLB_TRUE) {
         flb_http_set_content_encoding_gzip(client);
     }
-    /* TODO: Append other headers if needed*/
+
+    flb_config_map_foreach(head, mv, ctx->headers) {
+        key = mk_list_entry_first(mv->val.list, struct flb_slist_entry, _head);
+        val = mk_list_entry_last(mv->val.list, struct flb_slist_entry, _head);
+
+        flb_http_add_header(client,
+                            key->str, flb_sds_len(key->str),
+                            val->str, flb_sds_len(val->str));
+    }
 
     /* finaly send the query */
     ret = flb_http_do(client, &b_sent);
@@ -483,6 +506,11 @@ static struct flb_config_map config_map[] = {
      "Datadog supports and recommends setting this to 'gzip'."
     },
     {
+     FLB_CONFIG_MAP_SLIST_1, "header", NULL,
+     FLB_CONFIG_MAP_MULT, FLB_TRUE, offsetof(struct flb_out_datadog, headers),
+     "Add a HTTP header key/value pair. Multiple headers can be set"
+    },
+    {
      FLB_CONFIG_MAP_STR, "apikey", NULL,
      0, FLB_TRUE, offsetof(struct flb_out_datadog, api_key),
      "Datadog API key"
@@ -490,19 +518,32 @@ static struct flb_config_map config_map[] = {
     {
      FLB_CONFIG_MAP_STR, "dd_service", NULL,
      0, FLB_TRUE, offsetof(struct flb_out_datadog, dd_service),
-     "The human readable name for your service generating the logs "
-     "- the name of your application or database."
+     "The human readable name for your service generating the logs  "
+     "(e.g. the name of your application or database). If unset, Datadog "
+     "will look for the service using Service Remapper in Log Management "
+     "(by default it will look at the `service` and `syslog.appname` attributes)."
+     ""
     },
     {
      FLB_CONFIG_MAP_STR, "dd_source", NULL,
      0, FLB_TRUE, offsetof(struct flb_out_datadog, dd_source),
-     "A human readable name for the underlying technology of your service. "
-     "For example, 'postgres' or 'nginx'."
+     "A human readable name for the underlying technology of your service "
+     "(e.g. 'postgres' or 'nginx'). If unset, Datadog will expect the source "
+     "to be set as the `ddsource` attribute."
     },
     {
      FLB_CONFIG_MAP_STR, "dd_tags", NULL,
      0, FLB_TRUE, offsetof(struct flb_out_datadog, dd_tags),
-     "The tags you want to assign to your logs in Datadog."
+     "The tags you want to assign to your logs in Datadog. If unset, Datadog "
+     "will expect the tags in the `ddtags` attribute."
+    },
+    {
+     FLB_CONFIG_MAP_STR, "dd_hostname", NULL,
+     0, FLB_TRUE, offsetof(struct flb_out_datadog, dd_hostname),
+     "The host that emitted logs should be associated with. If unset, Datadog "
+     "will expect the host to be set as `host`, `hostname`, or `syslog.hostname` "
+     "attributes. See Datadog Logs preprocessor documentation for up-to-date "
+     "recognized attributes."
     },
 
     {
@@ -524,7 +565,7 @@ static struct flb_config_map config_map[] = {
      "This property is ignored"
     },
     {
-     FLB_CONFIG_MAP_STR, "dd_message_key", NULL,
+     FLB_CONFIG_MAP_STR, "dd_message_key", FLB_DATADOG_DEFAULT_LOG_KEY,
      0, FLB_TRUE, offsetof(struct flb_out_datadog, dd_message_key),
      "By default, the plugin searches for the key 'log' "
      "and remap the value to the key 'message'. "
